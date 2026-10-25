@@ -334,7 +334,10 @@ class LiveHandler(BaseHTTPRequestHandler):
     state: BridgeState  # set by the server factory
 
     def do_GET(self):  # noqa: N802
-        if self.path == "/api/live":
+        # Serve OnSong-compatible JSON at root (/) so G2Chords / G2Bridge
+        # can connect with just the IP address (no path, no port in UI).
+        # /api/live and /healthz are kept for compatibility.
+        if self.path in ("/", "/api/live"):
             payload = self.state.get_payload()
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
