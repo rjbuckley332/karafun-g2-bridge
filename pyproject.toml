@@ -1,0 +1,5 @@
+[karafun-g2-bridge]
+name = "Karafun → G2 Bridge"
+description = "Unlocks Karafun .kfn cache files and serves OnSong-shaped /api/live for G2Bridge / Even G2 teleprompter"
+version = "0.1.0"
+author = "Rich Buckley (Reach Higher LLC)"
