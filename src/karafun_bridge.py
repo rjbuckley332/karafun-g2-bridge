@@ -138,31 +138,38 @@ def parse_song_meta_xml(xml_text: str) -> dict | None:
 
 # --- OnSong-shaped payload builder ---
 
+LINES_PER_SCREEN = 4  # number of lyric lines to show at once
+
+
 def build_live_payload(song_title: str, key: str, section: int,
                        section_name: str, timeline: list[dict],
                        now_ms: int, fallback_line: str = "") -> dict:
-    """Build the OnSong-shaped /api/live payload G2Bridge consumes."""
-    current_text = fallback_line
-    current_parts: list[Any] = []
-    for ev in timeline:
+    """Build the OnSong-shaped /api/live payload G2Bridge consumes.
+
+    Returns the current line plus the next (LINES_PER_SCREEN - 1) upcoming
+    lines, so the teleprompter can show several lines at once.
+    """
+    # Find the index of the current line (the last line whose start <= now_ms).
+    current_idx = -1
+    for i, ev in enumerate(timeline):
         if ev["ms"] <= now_ms:
-            current_text = ev["text"]
+            current_idx = i
         else:
             break
 
-    if current_text:
-        current_parts = [current_text]
+    if current_idx < 0:
+        # Song hasn't started yet; show fallback as the first line.
+        lines = [{"parts": [fallback_line]}] if fallback_line else []
+    else:
+        end = min(current_idx + LINES_PER_SCREEN, len(timeline))
+        lines = [{"parts": [ev["text"]]} for ev in timeline[current_idx:end]]
 
     return {
         "songTitle": song_title,
         "key": key,
         "section": section,
         "sectionName": section_name,
-        "lines": [
-            {
-                "parts": current_parts,
-            }
-        ],
+        "lines": lines,
     }
 
 
