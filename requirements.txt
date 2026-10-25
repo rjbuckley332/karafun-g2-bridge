@@ -1,2 +1,4 @@
-watchdog>=4.0.0
-cryptography>=42.0.0
+watchdog==4.0.0
+cryptography==42.0.0
+# NOTE: karafun_bridge.py now uses only the Python stdlib (no external deps).
+# requirements.txt kept for reference; not required to run.

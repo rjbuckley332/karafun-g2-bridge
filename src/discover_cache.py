@@ -1,10 +1,14 @@
-"""Discover where Karafun writes its .kfn cache files on macOS.
+"""Discover where Karafun writes its cache on macOS.
+
+Karafun on Mac does NOT use .kfn files. It caches song metadata XML and
+timed-karaoke XML in:
+  ~/Library/Containers/com.recisio.kfiphone/Data/Library/Caches/com.recisio.kfiphone/fsCachedData
 
 Usage:
     python src/discover_cache.py
 
-This walks likely Application Support locations and prints any directory
-containing .kfn files, plus the most recently modified candidates.
+This scans likely locations and reports directories containing cached song
+XML (files with <song ...> or <karaoke ...> content).
 """
 
 from __future__ import annotations
@@ -15,59 +19,64 @@ from pathlib import Path
 
 HOME = Path.home()
 CANDIDATES = [
+    # Primary: the actual Karafun Mac container cache
+    HOME / "Library" / "Containers" / "com.recisio.kfiphone" / "Data" / "Library" / "Caches" / "com.recisio.kfiphone" / "fsCachedData",
+    # Fallback guesses
     HOME / "Library" / "Application Support" / "KaraFun",
     HOME / "Library" / "Application Support" / "KaraFun" / "Cache",
-    HOME / "Library" / "Containers" / "com.karafun.karafun" / "Data" / "Library" / "Application Support" / "KaraFun",
     HOME / "Library" / "Caches" / "KaraFun",
-    HOME / "Library" / "Caches" / "com.karafun.karafun",
     Path("/Library/Application Support/KaraFun"),
-    Path("/Library/Application Support/KaraFun/Cache"),
 ]
 
 
-def find_kfn_dirs(root: Path) -> list[Path]:
-    """Return directories under root that contain .kfn files (shallow scan)."""
-    hits: list[Path] = []
+def is_karafun_cache(path: Path) -> bool:
+    """Return True if the directory contains Karafun song/karaoke XML files."""
+    if not path.is_dir():
+        return False
     try:
-        for entry in root.iterdir():
-            if entry.is_dir():
-                kfn_count = sum(1 for f in entry.iterdir() if f.suffix.lower() == ".kfn")
-                if kfn_count:
-                    hits.append(entry)
+        for entry in path.iterdir():
+            if not entry.is_file():
+                continue
+            try:
+                with open(entry, "rb") as f:
+                    head = f.read(80)
+            except OSError:
+                continue
+            if b"<song" in head or b"<karaoke" in head:
+                return True
     except OSError:
         pass
-    return hits
+    return False
 
 
 def main() -> int:
-    print("Scanning likely Karafun locations on this Mac...\n")
+    print("Scanning likely Karafun cache locations on this Mac...\n")
     found_any = False
 
     for candidate in CANDIDATES:
         if not candidate.exists():
             print(f"[absent] {candidate}")
             continue
-        kfn_dirs = find_kfn_dirs(candidate)
-        if kfn_dirs:
+        if is_karafun_cache(candidate):
             found_any = True
-            for d in kfn_dirs:
-                kfns = sorted(d.glob("*.kfn"), key=lambda p: p.stat().st_mtime, reverse=True)
-                print(f"[found .kfn in] {d}")
-                for f in kfns[:5]:
-                    mtime = f.stat().st_mtime
-                    print(f"      {f.name}  ({f.stat().st_size} bytes, modified {mtime})")
+            files = sorted(candidate.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+            print(f"[found Karafun cache] {candidate}")
+            print(f"      {len(files)} cached files")
+            for f in files[:5]:
+                st = f.stat()
+                print(f"      {f.name}  ({st.st_size} bytes, modified {st.st_mtime})")
         else:
-            print(f"[empty/no .kfn] {candidate}")
+            print(f"[no Karafun cache] {candidate}")
 
     if not found_any:
-        print("\nNo .kfn files found in known locations.")
+        print("\nNo Karafun cache found in known locations.")
         print(
-            "Tip: launch Karafun, play/download a song, then re-run this script. "
-            "Karafun writes cache files only while streaming."
+            "Tip: launch Karafun and stream a song, then re-run this script. "
+            "Karafun writes cache XML only during playback."
         )
         return 1
 
-    print("\nDone. Point config.json `cache_dir` at the directory containing the .kfn files.")
+    print("\nDone. Point config.json `cache_dir` at the fsCachedData directory above.")
     return 0
 
 

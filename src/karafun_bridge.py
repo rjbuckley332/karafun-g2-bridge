@@ -1,12 +1,20 @@
-"""Karafun → OnSong-shaped lyric bridge.
+"""Karafun (macOS) → OnSong-shaped lyric bridge.
 
-Watches a Karafun cache directory for .kfn files, unlocks them (AES-128-ECB
-using the FLID header key — the karafunkey.py logic), extracts the SONG subfile
-.ini with time-synced lyrics, and serves an OnSong-compatible /api/live JSON
-endpoint so G2Bridge can drive the Even G2 teleprompter unchanged.
+Watches Karafun's macOS container cache (fsCachedData) for song metadata XML
+and timed-karaoke XML, extracts the time-synced lyrics, and serves an
+OnSong-compatible /api/live JSON endpoint so your existing G2Bridge can drive
+the Even G2 teleprompter unchanged.
+
+Karafun on Mac does NOT use .kfn files. It caches:
+  1. Song metadata XML:  <song id="11291" content="2d53ee"><title>...</title><artist>...</artist>...</song>
+  2. Karaoke XML:        <karaoke><page><line><word><syllabe><start>00:00:00,750</start><end>...</end><text>...</text></syllabe></word></line></page>
+
+G2Bridge stays untouched — it polls /api/live exactly like OnSong.
+
+Zero external dependencies — pure Python 3 stdlib.
 
 Run:
-    python src/karafun_bridge.py --config config.json
+    python3 src/karafun_bridge.py --config config.json
 """
 
 from __future__ import annotations
@@ -14,172 +22,118 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import struct
+import re
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+__version__ = "0.3.0"
 
-__version__ = "0.1.0"
+# --- Timestamp parsing: HH:MM:SS,mmm ---
 
-# --- KFN format constants (from karafunkey.py / WinslowJosiah) ---
-
-KFN_MAGIC = b"KFNB"
-VALID_EFFECT_IDS = {1, 2, 21, 51, 53, 61, 62}
-
-SONG = 1
-AUDIO = 2
-IMAGE = 3
-FONT = 4
-VIDEO = 5
-MILKDROP = 6
-CDG = 7
+_TIMESTAMP_RE = re.compile(r"^(\d+):(\d+):(-?\d+),(\d+)$")
 
 
-class KFNSubfile:
-    def __init__(self, name: bytes, ftype: int, data: bytes, length: int, is_encrypted: bool):
-        self.name = name
-        self.ftype = ftype
-        self.data = data
-        self.length = length
-        self.is_encrypted = is_encrypted
+def parse_timestamp(ts: str) -> int:
+    """Parse 'HH:MM:SS,mmm' (SS may be negative for pre-roll) into ms."""
+    m = _TIMESTAMP_RE.match(ts.strip())
+    if not m:
+        return 0
+    h, mi, s, ms = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    return ((h * 60 + mi) * 60 + s) * 1000 + ms
 
 
-class KFNFile:
-    def __init__(self):
-        self.headers: dict[str, Any] = {}
-        self.subfiles: list[KFNSubfile] = []
+# --- Karaoke XML parsing ---
 
+def _strip_xml_prefix(text: str) -> str:
+    """Remove binary junk before <?xml and after the root closing tag.
 
-def read_kfn(stream) -> KFNFile:
-    kfn = KFNFile()
-    stream.seek(0)
-    magic = struct.unpack("<4s", stream.read(4))[0]
-    if magic != KFN_MAGIC:
-        raise ValueError(f"unexpected file signature: {magic!r}")
-
-    while True:
-        header, flag = struct.unpack("<4sB", stream.read(5))
-        header = header.decode("latin-1")
-        if flag == 1:
-            data = struct.unpack("I", stream.read(4))[0]
-        elif flag == 2:
-            length = struct.unpack("I", stream.read(4))[0]
-            data = stream.read(length)
-        else:
-            raise ValueError(f"unexpected flag for header {header}: {flag}")
-        if header == "ENDH":
+    Karafun's cached karaoke files embed binary image data (JPEG/EXIF)
+    before/after the XML document. We keep only the XML portion.
+    """
+    start = text.find("<?xml")
+    if start > 0:
+        text = text[start:]
+    # Truncate at the first closing root tag so embedded binary is dropped.
+    for end_tag in ("</root>", "</karaoke>", "</response>"):
+        idx = text.find(end_tag)
+        if idx >= 0:
+            text = text[: idx + len(end_tag)]
             break
-        kfn.headers[header] = data
-
-    (subfile_count,) = struct.unpack("I", stream.read(4))
-    subfile_info = {}
-    for _ in range(subfile_count):
-        (name_length,) = struct.unpack("I", stream.read(4))
-        subfile_name = stream.read(name_length)
-        subfile_metadata = struct.unpack("IIIII", stream.read(20))
-        subfile_info[subfile_name] = subfile_metadata
-
-    subfiles_start = stream.tell()
-    for name, metadata in subfile_info.items():
-        ftype, length, offset, encrypted_length, is_encrypted = metadata
-        stream.seek(subfiles_start + offset)
-        data = stream.read(encrypted_length)
-        kfn.subfiles.append(
-            KFNSubfile(
-                name=name,
-                ftype=ftype,
-                data=data,
-                length=length,
-                is_encrypted=bool(is_encrypted),
-            )
-        )
-    return kfn
+    return text
 
 
-def unlock_kfn(kfn: KFNFile) -> KFNFile:
-    all_zeroes = bytes(16)
-    flid = kfn.headers.get("FLID")
-    if flid != all_zeroes and flid is not None:
-        cipher = Cipher(algorithms.AES128(flid), modes.ECB())
-        decryptor = cipher.decryptor()
-        kfn.headers["FLID"] = all_zeroes
-        for sub in kfn.subfiles:
-            if not sub.is_encrypted:
-                continue
-            sub.data = decryptor.update(sub.data)[: sub.length]
-            sub.is_encrypted = False
+def parse_karaoke_xml(xml_text: str) -> list[dict]:
+    """Parse Karafun karaoke XML into a list of {ms, text} lyric line events.
 
-    if "RGHT" in kfn.headers:
-        kfn.headers["RGHT"] = 0
-
-    for sub in kfn.subfiles:
-        if sub.ftype != SONG:
-            continue
-        try:
-            config_text = sub.data.decode("latin-1")
-        except UnicodeDecodeError:
-            continue
-        # Strip invalid effect sections (keep only known-good effect IDs)
-        lines = config_text.splitlines()
-        kept = []
-        in_bad_effect = False
-        for line in lines:
-            stripped = line.strip()
-            if stripped.lower().startswith("eff") and stripped.endswith("]"):
-                # eff[XX] header — decide by id inside the section body below;
-                # conservative: keep section header line, filter body by id.
-                kept.append(line)
-                continue
-            kept.append(line)
-        sub.data = "\n".join(kept).encode("latin-1")
-        sub.length = len(sub.data)
-
-    return kfn
-
-
-def extract_ini_text(kfn: KFNFile) -> str:
-    """Return the decoded .ini text from the SONG subfile, or '' if none."""
-    for sub in kfn.subfiles:
-        if sub.ftype == SONG:
-            try:
-                return sub.data.decode("latin-1")
-            except UnicodeDecodeError:
-                return sub.data.decode("utf-8", errors="replace")
-    return ""
-
-
-# --- .ini timestamp / lyric parsing ---
-
-import re
-
-_TIMESTAMP_RE = re.compile(r"^\[(\d+)\]:\s*(.*)$")
-
-
-def parse_ini_timeline(ini_text: str) -> list[dict]:
-    """Parse a Karafun .ini into a list of {ms, text} lyric events.
-
-    The .ini format is expected to contain lines like:
-        [12345]: lyric text here
-    where the number is the timestamp in milliseconds.
+    Each line's start time is the earliest syllable start within that line.
     """
     events: list[dict] = []
-    for line in ini_text.splitlines():
-        line = line.rstrip("\r")
-        m = _TIMESTAMP_RE.match(line)
-        if not m:
-            continue
-        ms = int(m.group(1))
-        text = m.group(2).strip()
-        events.append({"ms": ms, "text": text})
+    xml_text = _strip_xml_prefix(xml_text)
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return events
+
+    for page in root.iter("page"):
+        for line in page.iter("line"):
+            line_text_parts: list[str] = []
+            line_start_ms: int | None = None
+
+            for word in line.iter("word"):
+                word_text = ""
+                word_start_ms: int | None = None
+                for sy in word.iter("syllabe"):
+                    text_el = sy.find("text")
+                    if text_el is not None and text_el.text:
+                        word_text += text_el.text
+                    start_el = sy.find("start")
+                    if start_el is not None and start_el.text:
+                        ms = parse_timestamp(start_el.text)
+                        if word_start_ms is None or ms < word_start_ms:
+                            word_start_ms = ms
+                if word_text:
+                    line_text_parts.append(word_text)
+                if word_start_ms is not None:
+                    if line_start_ms is None or word_start_ms < line_start_ms:
+                        line_start_ms = word_start_ms
+
+            if line_text_parts and line_start_ms is not None:
+                events.append({
+                    "ms": line_start_ms,
+                    "text": " ".join(line_text_parts),
+                })
+
     events.sort(key=lambda e: e["ms"])
     return events
+
+
+def parse_song_meta_xml(xml_text: str) -> dict | None:
+    """Parse song metadata XML into {title, artist, year, song_id}."""
+    xml_text = _strip_xml_prefix(xml_text)
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+
+    song_el = root.find("song")
+    if song_el is None:
+        return None
+
+    title_el = song_el.find("title")
+    artist_el = song_el.find("artist")
+    year_el = song_el.find("year")
+
+    return {
+        "song_id": song_el.get("id"),
+        "title": title_el.text if title_el is not None else "",
+        "artist": artist_el.text if artist_el is not None else "",
+        "year": year_el.text if year_el is not None else "",
+    }
 
 
 # --- OnSong-shaped payload builder ---
@@ -188,7 +142,6 @@ def build_live_payload(song_title: str, key: str, section: int,
                        section_name: str, timeline: list[dict],
                        now_ms: int, fallback_line: str = "") -> dict:
     """Build the OnSong-shaped /api/live payload G2Bridge consumes."""
-    # Find the current lyric line based on elapsed song time.
     current_text = fallback_line
     current_parts: list[Any] = []
     for ev in timeline:
@@ -221,7 +174,7 @@ class BridgeState:
         self.lock = threading.Lock()
         self.timeline: list[dict] = []
         self.song_start_ms: float | None = None
-        self.current_song: str | None = None
+        self.current_song: dict | None = None
         self.payload: dict = build_live_payload(
             song_title=config.get("song_title", "Karafun Song"),
             key=config.get("key", "C"),
@@ -231,31 +184,65 @@ class BridgeState:
             now_ms=0,
             fallback_line=config.get("fallback_line", ""),
         )
+        # Pairing: metadata XML -> karaoke XML by song id
+        self._meta_by_id: dict[str, dict] = {}      # song_id -> meta
+        self._karaoke_by_id: dict[str, str] = {}     # song_id -> xml text
+        self._latest_meta: dict | None = None
 
-    def update_from_ini(self, ini_text: str, song_title: str) -> None:
-        timeline = parse_ini_timeline(ini_text)
-        now = time.time() * 1000
+    def load_meta(self, xml_text: str) -> dict | None:
+        meta = parse_song_meta_xml(xml_text)
+        if not meta:
+            return None
         with self.lock:
-            self.timeline = timeline
-            self.song_start_ms = now
-            self.current_song = song_title
-            self.payload = build_live_payload(
-                song_title=song_title,
-                key=self.config.get("key", "C"),
-                section=1,
-                section_name="",
-                timeline=timeline,
-                now_ms=0,  # song just started
-                fallback_line=self.config.get("fallback_line", ""),
-            )
+            song_id = meta.get("song_id")
+            if song_id:
+                self._meta_by_id[song_id] = meta
+            self._latest_meta = meta
+            # If we already have karaoke for this song, build the timeline now
+            if song_id and song_id in self._karaoke_by_id:
+                self._activate_song(meta, self._karaoke_by_id[song_id])
+        return meta
+
+    def load_karaoke(self, xml_text: str) -> None:
+        """Store karaoke XML; if we have matching meta, activate the song."""
+        # The karaoke XML doesn't carry the song id, so we pair by recency:
+        # the latest meta + this karaoke.
+        with self.lock:
+            if self._latest_meta and self._latest_meta.get("song_id"):
+                self._karaoke_by_id[self._latest_meta["song_id"]] = xml_text
+                self._activate_song(self._latest_meta, xml_text)
+
+    def _activate_song(self, meta: dict, karaoke_text: str) -> None:
+        timeline = parse_karaoke_xml(karaoke_text)
+        now = time.time() * 1000
+        self.timeline = timeline
+        self.song_start_ms = now
+        self.current_song = meta
+        title = meta.get("title") or self.config.get("song_title", "Karafun Song")
+        artist = meta.get("artist", "")
+        display_title = f"{title} — {artist}" if artist else title
+        self.payload = build_live_payload(
+            song_title=display_title,
+            key=self.config.get("key", "C"),
+            section=1,
+            section_name="",
+            timeline=timeline,
+            now_ms=0,  # song just started
+            fallback_line=self.config.get("fallback_line", ""),
+        )
+        print(f"[bridge] activated song: {display_title} ({len(timeline)} lyric lines)")
 
     def get_payload(self) -> dict:
         with self.lock:
-            payload = dict(self.payload)
             if self.song_start_ms is not None and self.timeline:
                 now_ms = int((time.time() * 1000) - self.song_start_ms)
-                payload = build_live_payload(
-                    song_title=self.config.get("song_title", "Karafun Song"),
+                title = self.config.get("song_title", "Karafun Song")
+                if self.current_song:
+                    t = self.current_song.get("title") or title
+                    a = self.current_song.get("artist", "")
+                    title = f"{t} — {a}" if a else t
+                return build_live_payload(
+                    song_title=title,
                     key=self.config.get("key", "C"),
                     section=1,
                     section_name="",
@@ -263,58 +250,82 @@ class BridgeState:
                     now_ms=now_ms,
                     fallback_line=self.config.get("fallback_line", ""),
                 )
-            return payload
+            return dict(self.payload)
 
 
-# --- File watcher ---
+# --- File watcher (polling, zero deps) ---
 
-class KfnHandler(FileSystemEventHandler):
-    def __init__(self, state: BridgeState, config: dict):
+SONG_META_PREFIX = b'<?xml version="1.0" encoding="UTF-8"?>\n<response status="OK">\n<song'
+KARAOKE_PREFIX = b'<karaoke'
+
+
+def classify_file(path: Path) -> str | None:
+    """Return 'meta', 'karaoke', or None based on file content.
+
+    Some cached files start with binary junk before the XML declaration, so we
+    read a larger chunk and search for the markers anywhere in it.
+    """
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(4096)
+    except OSError:
+        return None
+    if SONG_META_PREFIX in chunk or b"<song" in chunk:
+        return "meta"
+    if KARAOKE_PREFIX in chunk or b"<karaoke" in chunk:
+        return "karaoke"
+    return None
+
+
+class PollWatcher(threading.Thread):
+    def __init__(self, cache_dir: str, state: BridgeState, interval: float = 1.0):
+        super().__init__(daemon=True)
+        self.cache_dir = Path(cache_dir)
         self.state = state
-        self.config = config
-        self._processing: set[str] = set()
-        self._lock = threading.Lock()
+        self.interval = interval
+        self._stop = threading.Event()
+        self._seen: dict[str, float] = {}  # path -> mtime
 
-    def on_created(self, event):
-        if event.is_directory:
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        print(f"[bridge] watching {self.cache_dir}")
+        while not self._stop.is_set():
+            try:
+                self._scan()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[bridge] watcher error: {exc}")
+            self._stop.wait(self.interval)
+
+    def _scan(self) -> None:
+        if not self.cache_dir.exists():
             return
-        self._maybe_process(event.src_path)
-
-    def on_modified(self, event):
-        if event.is_directory:
-            return
-        self._maybe_process(event.src_path)
-
-    def _maybe_process(self, path: str) -> None:
-        p = Path(path)
-        if p.suffix.lower() != ".kfn":
-            return
-        with self._lock:
-            if str(p) in self._processing:
-                return
-            self._processing.add(str(p))
-        try:
-            self._process_file(p)
-        finally:
-            with self._lock:
-                self._processing.discard(str(p))
-
-    def _process_file(self, path: Path) -> None:
-        print(f"[bridge] detected .kfn: {path}")
-        try:
-            with open(path, "rb") as f:
-                kfn = read_kfn(f)
-            kfn = unlock_kfn(kfn)
-            ini_text = extract_ini_text(kfn)
-            if not ini_text.strip():
-                print(f"[bridge] no ini text in {path.name}")
-                return
-            # Use the filename (minus extension) as the song title.
-            song_title = path.stem
-            self.state.update_from_ini(ini_text, song_title)
-            print(f"[bridge] loaded {song_title}: {len(self.state.timeline)} lyric events")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[bridge] error processing {path}: {exc}")
+        for p in self.cache_dir.iterdir():
+            if not p.is_file():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            path = str(p)
+            prev_mtime = self._seen.get(path)
+            if prev_mtime is not None and st.st_mtime == prev_mtime:
+                continue
+            self._seen[path] = st.st_mtime
+            kind = classify_file(p)
+            if kind == "meta":
+                try:
+                    with open(p, "r", errors="replace") as f:
+                        self.state.load_meta(f.read())
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[bridge] error reading meta {p.name}: {exc}")
+            elif kind == "karaoke":
+                try:
+                    with open(p, "r", errors="replace") as f:
+                        self.state.load_karaoke(f.read())
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[bridge] error reading karaoke {p.name}: {exc}")
 
 
 # --- HTTP server ---
@@ -364,8 +375,41 @@ def load_config(config_path: str | None) -> dict:
     return config
 
 
+def seed_existing(state: BridgeState, cache_dir: str) -> None:
+    """Seed from any existing meta + karaoke XML files so we're not empty on start."""
+    cache_path = Path(cache_dir)
+    if not cache_path.exists():
+        return
+    meta_files = []
+    karaoke_files = []
+    for f in cache_path.iterdir():
+        if not f.is_file():
+            continue
+        kind = classify_file(f)
+        if kind == "meta":
+            meta_files.append(f)
+        elif kind == "karaoke":
+            karaoke_files.append(f)
+
+    # Load all metas
+    for f in meta_files:
+        try:
+            with open(f, "r", errors="replace") as fh:
+                state.load_meta(fh.read())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bridge] seed skip meta {f.name}: {exc}")
+
+    # Load all karaoke (pairs with latest meta)
+    for f in karaoke_files:
+        try:
+            with open(f, "r", errors="replace") as fh:
+                state.load_karaoke(fh.read())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bridge] seed skip karaoke {f.name}: {exc}")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Karafun → G2Bridge OnSong-shaped lyric bridge")
+    parser = argparse.ArgumentParser(description="Karafun (macOS) → G2Bridge OnSong-shaped lyric bridge")
     parser.add_argument("--config", default="config.json", help="path to config.json")
     parser.add_argument("--cache-dir", help="override cache directory")
     parser.add_argument("--port", type=int, default=8766, help="HTTP port")
@@ -380,32 +424,21 @@ def main() -> int:
     cache_dir = config.get("cache_dir", "")
     if not cache_dir or not Path(cache_dir).exists():
         print(f"[bridge] cache_dir not found: {cache_dir}")
-        print("       Run: python src/discover_cache.py  (after playing a song in Karafun)")
+        print(f"       Expected: ~/Library/Containers/com.recisio.kfiphone/Data/Library/Caches/com.recisio.kfiphone/fsCachedData")
+        print("       Run: python3 src/discover_cache.py  (after playing a song in Karafun)")
         return 1
 
     state = BridgeState(config)
     LiveHandler.state = state
 
-    # Seed from any existing .kfn files so we're not empty on start.
-    for kfn_path in sorted(Path(cache_dir).glob("*.kfn")):
-        try:
-            with open(kfn_path, "rb") as f:
-                kfn = read_kfn(f)
-            kfn = unlock_kfn(kfn)
-            ini_text = extract_ini_text(kfn)
-            if ini_text.strip():
-                state.update_from_ini(ini_text, kfn_path.stem)
-                print(f"[bridge] seeded from {kfn_path.name}")
-                break
-        except Exception as exc:  # noqa: BLE001
-            print(f"[bridge] seed skip {kfn_path.name}: {exc}")
+    # Seed from existing files.
+    seed_existing(state, cache_dir)
+    if state.current_song:
+        print(f"[bridge] seeded from existing cache: {state.current_song.get('title')}")
 
-    # Start the file watcher.
-    observer = Observer()
-    handler = KfnHandler(state, config)
-    observer.schedule(handler, cache_dir, recursive=False)
-    observer.start()
-    print(f"[bridge] watching {cache_dir}")
+    # Start the polling file watcher.
+    watcher = PollWatcher(cache_dir, state, interval=config.get("poll_interval_sec", 1.0))
+    watcher.start()
 
     # Start HTTP server.
     server = ThreadingHTTPServer((config["host"], config["port"]), LiveHandler)
@@ -417,8 +450,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n[bridge] shutting down...")
     finally:
-        observer.stop()
-        observer.join()
+        watcher.stop()
+        watcher.join(timeout=2)
         server.server_close()
     return 0
 
