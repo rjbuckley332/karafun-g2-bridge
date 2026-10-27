@@ -45,6 +45,13 @@ from typing import Any
 
 __version__ = "3.0.0"
 
+# single-instance guard: Task Scheduler "Run" must not spawn a duplicate
+if os.name == "nt":
+    import ctypes
+    ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\KaraFunBridge")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        raise SystemExit(0)
+
 LINES_PER_SCREEN = 4
 
 # --- Phone control page (queue + talk/sing + skip) ---
@@ -68,8 +75,9 @@ TALK_PAGE = """<!DOCTYPE html>
 <body>
 <div id="now">…</div>
 <div class="btns">
-  <button id="toggle">⏯ TALK / SING</button>
-  <button id="next">⏭ Skip to next song</button>
+  <button id="start" style="background:#27ae60">▶ START next song</button>
+  <button id="toggle" style="background:#c9a227">⏯ Pause / Resume</button>
+  <button id="next" style="background:#2980b9">⏭ Skip</button>
 </div>
 <div id="st" style="min-height:22px;font-size:16px;opacity:.85"></div>
 <h2>Up next</h2>
@@ -91,6 +99,7 @@ async function refresh() {
   } catch (e) {}
 }
 function cmd(x){ fetch('/control/'+x).then(r=>r.json()).then(d=>{ document.getElementById('st').textContent = d.ok ? '✓ sent (' + d.song + ')' : '✗ ' + d.msg; }).catch(()=>{ document.getElementById('st').textContent = '✗ no response'; }); }
+document.getElementById('start').onclick = () => { cmd('start'); setTimeout(refresh, 1500); };
 document.getElementById('toggle').onclick = () => cmd('playpause');
 document.getElementById('next').onclick = () => { cmd('next'); setTimeout(refresh, 1200); };
 refresh();
@@ -449,7 +458,7 @@ class LiveHandler(BaseHTTPRequestHandler):
         cmd = cmd.strip("/").lower()
         if cmd in ("play", "pause", "toggle"):
             cmd = "playpause"
-        if cmd not in ("playpause", "next"):
+        if cmd not in ("playpause", "next", "start", "enter"):
             self._send_json(400, b'{"ok":false,"msg":"unknown command"}\n')
             return
         try:
