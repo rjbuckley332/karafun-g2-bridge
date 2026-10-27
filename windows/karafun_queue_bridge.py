@@ -71,6 +71,7 @@ TALK_PAGE = """<!DOCTYPE html>
   <button id="toggle">⏯ TALK / SING</button>
   <button id="next">⏭ Skip to next song</button>
 </div>
+<div id="st" style="min-height:22px;font-size:16px;opacity:.85"></div>
 <h2>Up next</h2>
 <ul id="q"></ul>
 <script>
@@ -89,8 +90,9 @@ async function refresh() {
     });
   } catch (e) {}
 }
-document.getElementById('toggle').onclick = () => fetch('/control/playpause');
-document.getElementById('next').onclick = () => fetch('/control/next').then(() => setTimeout(refresh, 1200));
+function cmd(x){ fetch('/control/'+x).then(r=>r.json()).then(d=>{ document.getElementById('st').textContent = d.ok ? '✓ sent (' + d.song + ')' : '✗ ' + d.msg; }).catch(()=>{ document.getElementById('st').textContent = '✗ no response'; }); }
+document.getElementById('toggle').onclick = () => cmd('playpause');
+document.getElementById('next').onclick = () => { cmd('next'); setTimeout(refresh, 1200); };
 refresh();
 setInterval(refresh, 4000);
 </script>
