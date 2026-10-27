@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,55 @@ from typing import Any
 __version__ = "3.0.0"
 
 LINES_PER_SCREEN = 4
+
+# --- Phone control page (queue + talk/sing + skip) ---
+
+TALK_PAGE = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KaraFun</title>
+<style>
+  body { background:#111; color:#eee; font-family:system-ui; margin:0; padding:5vh 4vw 8vh; }
+  #now { font-size:22px; font-weight:600; margin-bottom:6px; }
+  #now small { opacity:.6; font-weight:400; }
+  .btns { display:flex; flex-direction:column; gap:14px; margin:22px 0 28px; }
+  button { font-size:32px; padding:26px 0; border:none; border-radius:16px; color:#fff; }
+  #toggle { background:#27ae60; }
+  #next { background:#2980b9; font-size:24px; padding:18px 0; }
+  h2 { font-size:17px; opacity:.7; margin:0 0 8px; }
+  #q { list-style:none; margin:0; padding:0; }
+  #q li { padding:10px 12px; background:#1d1d1d; border-radius:10px; margin-bottom:8px; font-size:18px; }
+  #q li span { opacity:.55; font-size:14px; }
+</style></head>
+<body>
+<div id="now">…</div>
+<div class="btns">
+  <button id="toggle">⏯ TALK / SING</button>
+  <button id="next">⏭ Skip to next song</button>
+</div>
+<h2>Up next</h2>
+<ul id="q"></ul>
+<script>
+async function refresh() {
+  try {
+    const [live, q] = await Promise.all([
+      fetch('/api/live').then(r => r.json()),
+      fetch('/queue').then(r => r.json())
+    ]);
+    document.getElementById('now').innerHTML = '🎤 ' + (live.songTitle || '—') + (live.lines && live.lines.length ? '' : ' <small>(no lyrics yet)</small>');
+    const ul = document.getElementById('q'); ul.innerHTML = '';
+    (q.queue || []).forEach((s, i) => {
+      const li = document.createElement('li');
+      li.innerHTML = (i+1) + '. ' + s.title + ' <span>' + (s.artist || '') + '</span>';
+      ul.appendChild(li);
+    });
+  } catch (e) {}
+}
+document.getElementById('toggle').onclick = () => fetch('/control/playpause');
+document.getElementById('next').onclick = () => fetch('/control/next').then(() => setTimeout(refresh, 1200));
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body></html>"""
 
 
 def build_live_payload(song_title: str, key: str, section: int,
@@ -357,6 +407,10 @@ class LiveHandler(BaseHTTPRequestHandler):
                     songs.append({"title": title})
             body = json.dumps({"songs": songs}).encode("utf-8")
             self._send_json(200, body)
+        elif path == "/talk":
+            self._send_talk_page()
+        elif path.startswith("/control/"):
+            self._handle_control(path[len("/control/"):])
         elif path.startswith("/lyrics/"):
             filename = path[len("/lyrics/"):]
             lyrics_dir = self.state._lyrics_dir
@@ -377,6 +431,35 @@ class LiveHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
+
+    def _send_talk_page(self) -> None:
+        data = TALK_PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_control(self, cmd: str) -> None:
+        """Proxy playback control to the user-session helper (the SYSTEM bridge
+        service can't inject keystrokes into the interactive desktop)."""
+        cmd = cmd.strip("/").lower()
+        if cmd in ("play", "pause", "toggle"):
+            cmd = "playpause"
+        if cmd not in ("playpause", "next"):
+            self._send_json(400, b'{"ok":false,"msg":"unknown command"}\n')
+            return
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:8769/{cmd}", timeout=3) as r:
+                helper = json.loads(r.read().decode())
+            ok = bool(helper.get("ok"))
+            msg = "sent" if ok else "helper refused"
+        except Exception:
+            ok = False
+            msg = "control helper not running (user session)"
+        body = json.dumps({"ok": ok, "msg": msg, "song": self.state.current_song_title}).encode("utf-8")
+        self._send_json(200, body)
 
     def log_message(self, fmt, *args):
         return
