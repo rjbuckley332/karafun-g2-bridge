@@ -1,0 +1,9 @@
+{
+  "cache_dir": "C:/ProgramData/Recisio/KaraFun 2/Cache",
+  "host": "0.0.0.0",
+  "port": 8766,
+  "poll_interval_sec": 1.0,
+  "song_title": "Karafun Song",
+  "key": "C",
+  "fallback_line": ""
+}
