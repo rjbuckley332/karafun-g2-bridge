@@ -538,7 +538,7 @@ def main() -> int:
         while True:
             time.sleep(config.get("queue_interval_sec", 5.0))
             try:
-                state.reload_lyrics_folder()   # pick up newly added lyric files without a restart
+                state.sync_lyrics_with_queue(appdata_dir)  # ensure -blank placeholders for new queue songs + re-index
                 state.refresh_queue(appdata_dir)
             except Exception as exc:
                 print(f"[bridge] queue refresh error: {exc}")
