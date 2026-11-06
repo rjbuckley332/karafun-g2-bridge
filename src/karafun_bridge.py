@@ -1,15 +1,18 @@
 """Karafun (macOS) → OnSong-shaped lyric bridge.
 
-Watches Karafun's macOS container cache (fsCachedData) for song metadata XML
-and timed-karaoke XML, extracts the time-synced lyrics, and serves an
-OnSong-compatible /api/live JSON endpoint so your existing G2Bridge can drive
-the Even G2 teleprompter unchanged.
+Watches Karafun's macOS container cache (fsCachedData) for timed-karaoke XML
+files, extracts the time-synced lyrics, and serves an OnSong-compatible
+/api/live JSON endpoint so G2Bridge / G2Karafun can drive the Even G2
+teleprompter unchanged.
 
-Karafun on Mac does NOT use .kfn files. It caches:
-  1. Song metadata XML:  <song id="11291" content="2d53ee"><title>...</title><artist>...</artist>...</song>
-  2. Karaoke XML:        <karaoke><page><line><word><syllabe><start>00:00:00,750</start><end>...</end><text>...</text></syllabe></word></line></page>
+Karafun on Mac does NOT use .kfn files. It caches karaoke XML like:
+  <karaoke version="1.0" ... duration="250"><kfntracks>...</kfntracks>
+    <page id="1"><line id="1"><word id="1"><syllabe><start>00:00:00,750</start><end>00:00:01,360</end><text>Just</text></syllabe></word>...</line></page>
+    ...
 
-G2Bridge stays untouched — it polls /api/live exactly like OnSong.
+The bridge watches for new/changed karaoke XML files, parses the timed lyrics,
+and serves 4 lines at once (current + 3 upcoming) based on elapsed song time.
+Fully automatic — no R1 ring required.
 
 Zero external dependencies — pure Python 3 stdlib.
 
@@ -31,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # --- Timestamp parsing: HH:MM:SS,mmm ---
 
@@ -50,15 +53,10 @@ def parse_timestamp(ts: str) -> int:
 # --- Karaoke XML parsing ---
 
 def _strip_xml_prefix(text: str) -> str:
-    """Remove binary junk before <?xml and after the root closing tag.
-
-    Karafun's cached karaoke files embed binary image data (JPEG/EXIF)
-    before/after the XML document. We keep only the XML portion.
-    """
+    """Remove binary junk before <?xml and after the root closing tag."""
     start = text.find("<?xml")
     if start > 0:
         text = text[start:]
-    # Truncate at the first closing root tag so embedded binary is dropped.
     for end_tag in ("</root>", "</karaoke>", "</response>"):
         idx = text.find(end_tag)
         if idx >= 0:
@@ -112,30 +110,6 @@ def parse_karaoke_xml(xml_text: str) -> list[dict]:
     return events
 
 
-def parse_song_meta_xml(xml_text: str) -> dict | None:
-    """Parse song metadata XML into {title, artist, year, song_id}."""
-    xml_text = _strip_xml_prefix(xml_text)
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return None
-
-    song_el = root.find("song")
-    if song_el is None:
-        return None
-
-    title_el = song_el.find("title")
-    artist_el = song_el.find("artist")
-    year_el = song_el.find("year")
-
-    return {
-        "song_id": song_el.get("id"),
-        "title": title_el.text if title_el is not None else "",
-        "artist": artist_el.text if artist_el is not None else "",
-        "year": year_el.text if year_el is not None else "",
-    }
-
-
 # --- OnSong-shaped payload builder ---
 
 LINES_PER_SCREEN = 4  # number of lyric lines to show at once
@@ -144,12 +118,11 @@ LINES_PER_SCREEN = 4  # number of lyric lines to show at once
 def build_live_payload(song_title: str, key: str, section: int,
                        section_name: str, timeline: list[dict],
                        now_ms: int, fallback_line: str = "") -> dict:
-    """Build the OnSong-shaped /api/live payload G2Bridge consumes.
+    """Build the OnSong-shaped /api/live payload.
 
     Returns the current line plus the next (LINES_PER_SCREEN - 1) upcoming
     lines, so the teleprompter can show several lines at once.
     """
-    # Find the index of the current line (the last line whose start <= now_ms).
     current_idx = -1
     for i, ev in enumerate(timeline):
         if ev["ms"] <= now_ms:
@@ -158,7 +131,6 @@ def build_live_payload(song_title: str, key: str, section: int,
             break
 
     if current_idx < 0:
-        # Song hasn't started yet; show fallback as the first line.
         lines = [{"parts": [fallback_line]}] if fallback_line else []
     else:
         end = min(current_idx + LINES_PER_SCREEN, len(timeline))
@@ -181,9 +153,9 @@ class BridgeState:
         self.lock = threading.Lock()
         self.timeline: list[dict] = []
         self.song_start_ms: float | None = None
-        self.current_song: dict | None = None
+        self.current_song_title: str = config.get("song_title", "Karafun Song")
         self.payload: dict = build_live_payload(
-            song_title=config.get("song_title", "Karafun Song"),
+            song_title=self.current_song_title,
             key=config.get("key", "C"),
             section=1,
             section_name="",
@@ -191,45 +163,21 @@ class BridgeState:
             now_ms=0,
             fallback_line=config.get("fallback_line", ""),
         )
-        # Pairing: metadata XML -> karaoke XML by song id
-        self._meta_by_id: dict[str, dict] = {}      # song_id -> meta
-        self._karaoke_by_id: dict[str, str] = {}     # song_id -> xml text
-        self._latest_meta: dict | None = None
+        # Track the most recently seen karaoke file path to avoid re-activating.
+        self._last_karaoke_path: str | None = None
 
-    def load_meta(self, xml_text: str) -> dict | None:
-        meta = parse_song_meta_xml(xml_text)
-        if not meta:
-            return None
-        with self.lock:
-            song_id = meta.get("song_id")
-            if song_id:
-                self._meta_by_id[song_id] = meta
-            self._latest_meta = meta
-            # If we already have karaoke for this song, build the timeline now
-            if song_id and song_id in self._karaoke_by_id:
-                self._activate_song(meta, self._karaoke_by_id[song_id])
-        return meta
-
-    def load_karaoke(self, xml_text: str) -> None:
-        """Store karaoke XML; if we have matching meta, activate the song."""
-        # The karaoke XML doesn't carry the song id, so we pair by recency:
-        # the latest meta + this karaoke.
-        with self.lock:
-            if self._latest_meta and self._latest_meta.get("song_id"):
-                self._karaoke_by_id[self._latest_meta["song_id"]] = xml_text
-                self._activate_song(self._latest_meta, xml_text)
-
-    def _activate_song(self, meta: dict, karaoke_text: str) -> None:
-        timeline = parse_karaoke_xml(karaoke_text)
+    def activate_from_karaoke(self, xml_text: str, song_title: str) -> None:
+        """Parse a karaoke XML file and activate it as the current song."""
+        timeline = parse_karaoke_xml(xml_text)
+        if not timeline:
+            print("[bridge] karaoke XML had no parseable lyric lines; skipping")
+            return
         now = time.time() * 1000
         self.timeline = timeline
         self.song_start_ms = now
-        self.current_song = meta
-        title = meta.get("title") or self.config.get("song_title", "Karafun Song")
-        artist = meta.get("artist", "")
-        display_title = f"{title} — {artist}" if artist else title
+        self.current_song_title = song_title
         self.payload = build_live_payload(
-            song_title=display_title,
+            song_title=song_title,
             key=self.config.get("key", "C"),
             section=1,
             section_name="",
@@ -237,19 +185,14 @@ class BridgeState:
             now_ms=0,  # song just started
             fallback_line=self.config.get("fallback_line", ""),
         )
-        print(f"[bridge] activated song: {display_title} ({len(timeline)} lyric lines)")
+        print(f"[bridge] activated song: {song_title} ({len(timeline)} lyric lines)")
 
     def get_payload(self) -> dict:
         with self.lock:
             if self.song_start_ms is not None and self.timeline:
                 now_ms = int((time.time() * 1000) - self.song_start_ms)
-                title = self.config.get("song_title", "Karafun Song")
-                if self.current_song:
-                    t = self.current_song.get("title") or title
-                    a = self.current_song.get("artist", "")
-                    title = f"{t} — {a}" if a else t
                 return build_live_payload(
-                    song_title=title,
+                    song_title=self.current_song_title,
                     key=self.config.get("key", "C"),
                     section=1,
                     section_name="",
@@ -262,26 +205,17 @@ class BridgeState:
 
 # --- File watcher (polling, zero deps) ---
 
-SONG_META_PREFIX = b'<?xml version="1.0" encoding="UTF-8"?>\n<response status="OK">\n<song'
 KARAOKE_PREFIX = b'<karaoke'
 
 
-def classify_file(path: Path) -> str | None:
-    """Return 'meta', 'karaoke', or None based on file content.
-
-    Some cached files start with binary junk before the XML declaration, so we
-    read a larger chunk and search for the markers anywhere in it.
-    """
+def classify_karaoke(path: Path) -> bool:
+    """Return True if the file contains a <karaoke> element."""
     try:
         with open(path, "rb") as f:
             chunk = f.read(4096)
     except OSError:
-        return None
-    if SONG_META_PREFIX in chunk or b"<song" in chunk:
-        return "meta"
-    if KARAOKE_PREFIX in chunk or b"<karaoke" in chunk:
-        return "karaoke"
-    return None
+        return False
+    return b"<karaoke" in chunk
 
 
 class PollWatcher(threading.Thread):
@@ -320,17 +254,13 @@ class PollWatcher(threading.Thread):
             if prev_mtime is not None and st.st_mtime == prev_mtime:
                 continue
             self._seen[path] = st.st_mtime
-            kind = classify_file(p)
-            if kind == "meta":
+            if classify_karaoke(p):
                 try:
                     with open(p, "r", errors="replace") as f:
-                        self.state.load_meta(f.read())
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[bridge] error reading meta {p.name}: {exc}")
-            elif kind == "karaoke":
-                try:
-                    with open(p, "r", errors="replace") as f:
-                        self.state.load_karaoke(f.read())
+                        xml_text = f.read()
+                    # Use filename (minus extension) as the song title.
+                    song_title = p.stem
+                    self.state.activate_from_karaoke(xml_text, song_title)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[bridge] error reading karaoke {p.name}: {exc}")
 
@@ -340,6 +270,17 @@ class PollWatcher(threading.Thread):
 class LiveHandler(BaseHTTPRequestHandler):
     state: BridgeState  # set by the server factory
 
+    def _send_json(self, code: int, body: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):  # noqa: N802
         # Serve OnSong-compatible JSON at root (/) so G2Chords / G2Bridge
         # can connect with just the IP address (no path, no port in UI).
@@ -347,22 +288,21 @@ class LiveHandler(BaseHTTPRequestHandler):
         if self.path in ("/", "/api/live"):
             payload = self.state.get_payload()
             body = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(200, body)
         elif self.path == "/healthz":
             body = b'{"status":"ok"}\n'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_json(200, body)
         else:
-            self.send_response(404)
-            self.end_headers()
+            body = b'{"error":"not found"}\n'
+            self._send_json(404, body)
+
+    def do_OPTIONS(self):  # noqa: N802
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
 
     def log_message(self, fmt, *args):  # silence default noise
         return
@@ -386,36 +326,28 @@ def load_config(config_path: str | None) -> dict:
 
 
 def seed_existing(state: BridgeState, cache_dir: str) -> None:
-    """Seed from any existing meta + karaoke XML files so we're not empty on start."""
+    """Seed from any existing karaoke XML files so we're not empty on start."""
     cache_path = Path(cache_dir)
     if not cache_path.exists():
         return
-    meta_files = []
     karaoke_files = []
     for f in cache_path.iterdir():
         if not f.is_file():
             continue
-        kind = classify_file(f)
-        if kind == "meta":
-            meta_files.append(f)
-        elif kind == "karaoke":
+        if classify_karaoke(f):
             karaoke_files.append(f)
 
-    # Load all metas
-    for f in meta_files:
-        try:
-            with open(f, "r", errors="replace") as fh:
-                state.load_meta(fh.read())
-        except Exception as exc:  # noqa: BLE001
-            print(f"[bridge] seed skip meta {f.name}: {exc}")
+    if not karaoke_files:
+        return
 
-    # Load all karaoke (pairs with latest meta)
-    for f in karaoke_files:
-        try:
-            with open(f, "r", errors="replace") as fh:
-                state.load_karaoke(fh.read())
-        except Exception as exc:  # noqa: BLE001
-            print(f"[bridge] seed skip karaoke {f.name}: {exc}")
+    # Use the most recently modified karaoke file as the seed.
+    karaoke_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    f = karaoke_files[0]
+    try:
+        with open(f, "r", errors="replace") as fh:
+            state.activate_from_karaoke(fh.read(), f.stem)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[bridge] seed skip karaoke {f.name}: {exc}")
 
 
 def main() -> int:
@@ -441,10 +373,10 @@ def main() -> int:
     state = BridgeState(config)
     LiveHandler.state = state
 
-    # Seed from existing files.
+    # Seed from existing karaoke files.
     seed_existing(state, cache_dir)
-    if state.current_song:
-        print(f"[bridge] seeded from existing cache: {state.current_song.get('title')}")
+    if state.song_start_ms is not None:
+        print(f"[bridge] seeded from existing cache: {state.current_song_title}")
 
     # Start the polling file watcher.
     watcher = PollWatcher(cache_dir, state, interval=config.get("poll_interval_sec", 1.0))
